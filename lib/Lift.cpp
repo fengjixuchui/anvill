@@ -166,8 +166,13 @@ class TraceManagerImpl final : public TraceManager {
       llvm::Module &semantics_module,
       const Program &program_)
       : intrinsics(&semantics_module),
-        program(program_),
-        initial_stack_pointer(*(program.InitialStackPointer())) {}
+        program(program_) {
+    auto sp = program.InitialStackPointer();
+    if (!sp) {
+      LOG(FATAL) << "Found invalid initial stack pointer";
+    }
+    initial_stack_pointer = *sp;
+  }
 
   // Use something that won't conflict with our default naming of
   // unnamed `FunctionDecl`s so that we avoid some declaration vs.
@@ -242,16 +247,20 @@ class TraceManagerImpl final : public TraceManager {
   std::unordered_map<uint64_t, llvm::Function *> decompiled_funcs;
 
   // Initial stack pointer value.
-  const uint64_t initial_stack_pointer;
+  uint64_t initial_stack_pointer;
 };
 
 // Try to read an executable byte of memory. Returns `true` of the byte
-// at address `addr` is executable and readable, and updates the byte
-// pointed to by `byte` with the read value.
+// at address `addr` is executable, and updates the byte pointed to by
+// `byte` with the read value.
 bool TraceManagerImpl::TryReadExecutableByte(uint64_t addr, uint8_t *byte) {
   if (auto addr_byte = program.FindByte(addr)) {
-    if (addr_byte.IsExecutable() && !addr_byte.IsWriteable()) {
-      *byte = *addr_byte.Value();
+    if (addr_byte.IsExecutable()) {
+      auto val = addr_byte.Value();
+      if (!val) {
+        return false;
+      }
+      *byte = *val;
       return true;
     }
   }
