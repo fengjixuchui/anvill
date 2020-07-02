@@ -1,5 +1,5 @@
 
-# Copyright (c) 2019 Trail of Bits, Inc.
+# Copyright (c) 2020 Trail of Bits, Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -21,6 +21,10 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/settings.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/utils.cmake")
 
 FindAndSelectClangCompiler()
+
+macro(target_public_headers TARGET)
+  set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${ARGN}")
+endmacro()
 
 # warnings and compiler settings
 if(NOT DEFINED WIN32)
@@ -50,21 +54,40 @@ endif()
 set(ANVILL anvill-${REMILL_LLVM_VERSION})
 
 add_library(${ANVILL} STATIC
-    include/anvill/Decl.h
-    include/anvill/Program.h
     include/anvill/Type.h
-    include/anvill/TypeParser.h
-    include/anvill/TypePrinter.h
-    lib/Arch/Arch.h
-    lib/AllocationState.h
 
     lib/Arch/X86_C.cpp
+    lib/Arch/X86_FastCall.cpp
+    lib/Arch/X86_StdCall.cpp
+    lib/Arch/X86_ThisCall.cpp
     lib/Arch/X86_64_SysV.cpp
+    
+    lib/Arch/AllocationState.h
+    lib/Arch/AllocationState.cpp
+    
+    lib/Arch/Arch.h
     lib/Arch/Arch.cpp
+    
+    include/anvill/TypeParser.h
     lib/TypeParser.cpp
+    
+    include/anvill/TypePrinter.h
     lib/TypePrinter.cpp
-    lib/AllocationState.cpp
-    lib/Program.cpp lib/Decl.cpp include/anvill/Lift.h lib/Lift.cpp lib/Lift.h include/anvill/Optimize.h lib/Optimize.cpp include/anvill/Analyze.h lib/Analyze.cpp)
+    
+    include/anvill/Program.h
+    lib/Program.cpp
+    
+    include/anvill/Decl.h
+    lib/Decl.cpp
+    
+    include/anvill/Lift.h
+    lib/Lift.cpp
+    
+    include/anvill/Optimize.h
+    lib/Optimize.cpp
+    
+    include/anvill/Analyze.h
+    lib/Analyze.cpp)
 
 target_compile_definitions(${ANVILL} PUBLIC
     ${PROJECT_DEFINITIONS})
@@ -76,6 +99,17 @@ target_include_directories(${ANVILL} PUBLIC
    "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 target_link_libraries(${ANVILL} PUBLIC remill)
+
+target_public_headers(${ANVILL}
+    include/anvill/Analyze.h
+    include/anvill/Decl.h
+    include/anvill/Lift.h
+    include/anvill/Optimize.h
+    include/anvill/Program.h
+    include/anvill/Type.h
+    include/anvill/TypeParser.h
+    include/anvill/TypePrinter.h
+  )
 
 #
 # tool target settings
@@ -89,8 +123,41 @@ target_link_libraries(${DECOMPILE_JSON} PRIVATE ${ANVILL})
 
 set(SPECIFY_BITCODE anvill-specify-bitcode-${REMILL_LLVM_VERSION})
 
-add_executable(${SPECIFY_BITCODE} BITCODE.cpp lib/AllocationState.cpp)
+add_executable(${SPECIFY_BITCODE} Bitcode.cpp)
 target_link_libraries(${SPECIFY_BITCODE} PRIVATE ${ANVILL})
+
+
+add_custom_target(install_anvill_python
+  DEPENDS
+  setup.py
+  python/anvill/__init__.py
+  python/anvill/arch.py
+  python/anvill/binja.py
+  python/anvill/dwarf.py
+  python/anvill/exc.py
+  python/anvill/function.py
+  python/anvill/ida.py
+  python/anvill/loc.py
+  python/anvill/mem.py
+  python/anvill/os.py
+  python/anvill/program.py
+  python/anvill/type.py
+  python/anvill/var.py)
+
+add_custom_command(
+    TARGET install_anvill_python POST_BUILD
+    COMMAND which python2 && python2 setup.py install --force --user --prefix=
+    COMMENT "Installing Anvill Python 2.7 API"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_custom_command(
+    TARGET install_anvill_python POST_BUILD
+    COMMAND which python3 && python3 setup.py install --force --user --prefix=
+    COMMENT "Installing Anvill Python 3 API"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_dependencies(${ANVILL}
+  install_anvill_python)
 
 #
 # install settings
@@ -110,3 +177,4 @@ install(
 install(
     TARGETS ${DECOMPILE_JSON}
     RUNTIME DESTINATION "${install_folder}/bin")
+

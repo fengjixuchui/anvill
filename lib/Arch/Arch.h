@@ -1,29 +1,43 @@
+/*
+ * Copyright (c) 2020 Trail of Bits, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #pragma once
 
 #include <string>
 #include <vector>
 
-#include <llvm/IR/DebugInfoMetadata.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/Instructions.h>
-#include <llvm/IR/IntrinsicInst.h>
-#include <llvm/IR/Metadata.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/Type.h>
+#include <llvm/IR/CallingConv.h>
 
-#include "anvill/Decl.h"
+#include <remill/BC/Compat/Error.h>
 
+namespace llvm {
+class Function;
+}  // namespace llvm
 namespace remill {
 class Arch;
+enum ArchName : uint32_t;
 class IntrinsicTable;
 struct Register;
 }  // namespace remill
-
 namespace anvill {
 
-enum class ArchExt {
-  AVX, AVX512
-};
+struct FunctionDecl;
+struct ValueDecl;
+struct ParameterDecl;
 
 enum SizeConstraint : unsigned {
   kBit8 = (1 << 0),
@@ -61,6 +75,7 @@ enum TypeConstraint : unsigned {
   kTypeVec = (1 << 3),
 
   kTypeIntegral = kTypeInt | kTypePtr,
+  kTypeNumeric = kTypeIntegral | kTypeFloat,
   kTypeFloatOrVec = kTypeFloat | kTypeVec,
 };
 
@@ -88,192 +103,70 @@ struct RegisterConstraint {
 };
 
 struct SizeAndType {
-  SizeAndType(SizeConstraint _sc, TypeConstraint _tc) : sc(_sc), tc(_tc) {}
+  SizeAndType(SizeConstraint _sc, TypeConstraint _tc)
+      : sc(_sc),
+        tc(_tc) {}
 
   SizeConstraint sc;
   TypeConstraint tc;
 };
 
-std::map<unsigned, std::string> TryRecoverParamNames(
-    const llvm::Function &function);
+std::vector<std::string> TryRecoverParamNames(const llvm::Function &function);
+
+// Return a vector of register constraints, augmented to to support additional
+// registers made available in AVX or AVX512.
 std::vector<RegisterConstraint> ApplyX86Ext(
-    const std::vector<RegisterConstraint> &constraints, ArchExt ext);
+    const std::vector<RegisterConstraint> &constraints,
+    remill::ArchName arch_name);
+
+// Select and return one of `basic`, `avx`, or `avx512` given `arch_name`.
+const std::vector<RegisterConstraint> &SelectX86Constraint(
+    remill::ArchName arch_name,
+    const std::vector<RegisterConstraint> &basic,
+    const std::vector<RegisterConstraint> &avx,
+    const std::vector<RegisterConstraint> &avx512);
 
 class CallingConvention {
  public:
   CallingConvention(llvm::CallingConv::ID _identity, const remill::Arch *_arch)
-      : arch(_arch), identity(_identity) {}
-  virtual ~CallingConvention() = default;
+      : arch(_arch),
+        identity(_identity) {}
 
-  static std::unique_ptr<CallingConvention> CreateCCFromArch(
+  virtual ~CallingConvention(void) = default;
+
+  static llvm::Expected<std::unique_ptr<CallingConvention>> CreateCCFromArch(
       const remill::Arch *arch);
-  static std::unique_ptr<CallingConvention> CreateCCFromCCID(
+
+  static llvm::Expected<std::unique_ptr<CallingConvention>> CreateCCFromCCID(
       const llvm::CallingConv::ID, const remill::Arch *arch);
-  virtual void AllocateSignature(FunctionDecl &fdecl,
-                                 const llvm::Function &func) = 0;
-  llvm::CallingConv::ID getIdentity() const { return identity; }
+
+  virtual llvm::Error AllocateSignature(FunctionDecl &fdecl,
+                                        llvm::Function &func) = 0;
+
+  llvm::CallingConv::ID getIdentity(void) const {
+    return identity;
+  }
 
  protected:
-  const remill::Arch *arch;
+  const remill::Arch * const arch;
+
+  static std::unique_ptr<CallingConvention> CreateX86_C(
+      const remill::Arch *arch);
+
+  static std::unique_ptr<CallingConvention> CreateX86_StdCall(
+      const remill::Arch *arch);
+
+  static std::unique_ptr<CallingConvention> CreateX86_FastCall(
+      const remill::Arch *arch);
+
+  static std::unique_ptr<CallingConvention> CreateX86_ThisCall(
+      const remill::Arch *arch);
+
+  static std::unique_ptr<CallingConvention> CreateX86_64_SysV(
+      const remill::Arch *arch);
 
  private:
-  llvm::CallingConv::ID identity;
-};
-
-class X86_64_SysV : public CallingConvention {
- public:
-  X86_64_SysV(const remill::Arch *arch);
-  virtual ~X86_64_SysV() = default;
-  void AllocateSignature(FunctionDecl &fdecl, const llvm::Function &func);
-  std::vector<ParameterDecl> BindParameters(const llvm::Function &function,
-                                            bool injected_sret);
-  std::vector<ValueDecl> BindReturnValues(const llvm::Function &function,
-                                          bool &injected_sret);
-  void BindReturnStackPointer(FunctionDecl &fdecl, const llvm::Function &func);
-
- private:
-  std::vector<RegisterConstraint> parameter_register_constraints = {
-      RegisterConstraint({
-          VariantConstraint("DIL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("DI", kTypeIntegral, kMaxBit16),
-          VariantConstraint("EDI", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RDI", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("SIL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("SI", kTypeIntegral, kMaxBit16),
-          VariantConstraint("ESI", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RSI", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("DL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("DX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("EDX", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RDX", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("CL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("CX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("ECX", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RCX", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("R8L", kTypeIntegral, kMaxBit8),
-          VariantConstraint("R8W", kTypeIntegral, kMaxBit16),
-          VariantConstraint("R8D", kTypeIntegral, kMaxBit32),
-          VariantConstraint("R8", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("R9L", kTypeIntegral, kMaxBit8),
-          VariantConstraint("R9W", kTypeIntegral, kMaxBit16),
-          VariantConstraint("R9D", kTypeIntegral, kMaxBit32),
-          VariantConstraint("R9", kTypeIntegral, kMaxBit64),
-      }),
-
-      RegisterConstraint(
-          {VariantConstraint("XMM0", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM1", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM2", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM3", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM4", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM5", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM6", kTypeFloatOrVec, kMaxBit128)}),
-      RegisterConstraint(
-          {VariantConstraint("XMM7", kTypeFloatOrVec, kMaxBit128)}),
-  };
-
-  // This a bit undocumented and warrants and explanation. For x86_64, clang has
-  // the option to split a created (not passed by reference) struct over the
-  // following registers: RAX, RDX, RCX, XMM0, XMM1, ST0, ST1. The first 3 are
-  // used for integer or pointer types and the last 4 are used for floating
-  // point values. If there is no valid struct split using these registers then
-  // the compiler will try RVO.
-  const std::vector<RegisterConstraint> return_register_constraints = {
-      RegisterConstraint({
-          VariantConstraint("AL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("AX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("EAX", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RAX", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("DL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("DX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("EDX", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RDX", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({
-          VariantConstraint("CL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("CX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("ECX", kTypeIntegral, kMaxBit32),
-          VariantConstraint("RCX", kTypeIntegral, kMaxBit64),
-      }),
-      RegisterConstraint({VariantConstraint("XMM0", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM1", kTypeVec, kMaxBit128)}),
-
-      // Since the FPU registers are 80 bits wide, they are only able to hold
-      // 64-bit values.
-      RegisterConstraint({VariantConstraint("ST0", kTypeVec, kMaxBit80)}),
-      RegisterConstraint({VariantConstraint("ST1", kTypeVec, kMaxBit80)}),
-  };
-};
-
-// This is the cdecl calling convention referenced by llvm::CallingConv::C
-class X86_C : public CallingConvention {
- public:
-  X86_C(const remill::Arch *arch);
-  virtual ~X86_C() = default;
-  void AllocateSignature(FunctionDecl &fdecl, const llvm::Function &func);
-  std::vector<ParameterDecl> BindParameters(const llvm::Function &function,
-                                            bool injected_sret);
-  std::vector<ValueDecl> BindReturnValues(const llvm::Function &function,
-                                          bool &injected_sret);
-  void BindReturnStackPointer(FunctionDecl &fdecl, const llvm::Function &func,
-                              bool injected_sret);
-
- private:
-  // Register based parameter passing is generally not allowed for x86_C for
-  // types other than vector types. Even in the case of vector types it is
-  // important to note that if LLVM lowers something like a vector(2) of floats
-  // to <float, float> in IR, we will not be able to allocate it to a vector
-  // register because in our eyes it will no longer be a vector. This is
-  // consistent with the behavior of Clang but not GCC.
-  std::vector<RegisterConstraint> parameter_register_constraints = {
-      RegisterConstraint({VariantConstraint("XMM0", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM1", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM2", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM3", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM4", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM5", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM6", kTypeVec, kMaxBit128)}),
-      RegisterConstraint({VariantConstraint("XMM7", kTypeVec, kMaxBit128)}),
-  };
-
-  // For x86_C (cdecl), structs can be split over EAX, EDX, ECX, ST0, ST1.
-  const std::vector<RegisterConstraint> return_register_constraints = {
-      RegisterConstraint({
-          VariantConstraint("AL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("AX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("EAX", kTypeIntegral, kMaxBit32),
-      }),
-      RegisterConstraint({
-          VariantConstraint("DL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("DX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("EDX", kTypeIntegral, kMaxBit32),
-      }),
-      RegisterConstraint({
-          VariantConstraint("CL", kTypeIntegral, kMaxBit8),
-          VariantConstraint("CX", kTypeIntegral, kMaxBit16),
-          VariantConstraint("ECX", kTypeIntegral, kMaxBit32),
-      }),
-      RegisterConstraint({VariantConstraint("ST0", kTypeVec, kMaxBit80)}),
-      RegisterConstraint({VariantConstraint("ST1", kTypeVec, kMaxBit80)}),
-  };
+  const llvm::CallingConv::ID identity;
 };
 
 }  // namespace anvill
