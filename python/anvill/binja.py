@@ -13,7 +13,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import magic
 import binaryninja as bn
 
 from .arch import *
@@ -127,8 +126,8 @@ def _collect_code_xrefs_from_insn(bv, insn, ref_eas, reftype=XrefType.XREF_NONE)
 
 def _convert_binja_type(tinfo, cache):
   """Convert an Binja `Type` instance into a `Type` instance."""
-  if tinfo in cache:
-    return cache[tinfo]
+  if str(tinfo) in cache:
+    return cache[str(tinfo)]
 
   # Void type.
   if tinfo.type_class == bn.TypeClass.VoidTypeClass:
@@ -137,13 +136,13 @@ def _convert_binja_type(tinfo, cache):
   # Pointer, array, or function.
   elif tinfo.type_class == bn.TypeClass.PointerTypeClass:
     ret = PointerType()
-    cache[tinfo] = ret
+    cache[str(tinfo)] = ret
     ret.set_element_type(_convert_binja_type(tinfo.element_type, cache))
     return ret
 
   elif tinfo.type_class == bn.TypeClass.FunctionTypeClass:
     ret = FunctionType()
-    cache[tinfo] = ret
+    cache[str(tinfo)] = ret
     ret.set_return_type(_convert_binja_type(tinfo.return_value, cache))
     
     index = 0
@@ -157,19 +156,19 @@ def _convert_binja_type(tinfo, cache):
 
   elif tinfo.type_class == bn.TypeClass.ArrayTypeClass:
     ret = ArrayType()
-    cache[tinfo] = ret
+    cache[str(tinfo)] = ret
     ret.set_element_type(_convert_binja_type(tinfo.element_type, cache))
     ret.set_num_elements(tinfo.count)
     return ret
 
   elif tinfo.type_class == bn.TypeClass.StructureTypeClass:
     ret = StructureType()
-    cache[tinfo] = ret
+    cache[str(tinfo)] = ret
     return ret
 
   elif tinfo.type_class == bn.TypeClass.EnumerationTypeClass:
     ret = EnumType()
-    cache[tinfo] = ret
+    cache[str(tinfo)] = ret
     return ret
 
   elif tinfo.type_class == bn.TypeClass.BoolTypeClass:
@@ -328,6 +327,7 @@ class BNFunction(Function):
         ea += 1
 
 def load_binary(path):
+  import magic
   file_type = magic.from_file(path)
   if 'ELF' in file_type:
     bv_type = bn.BinaryViewType['ELF']
@@ -345,10 +345,14 @@ def load_binary(path):
   return bv
 
 class BNProgram(Program):
-  def __init__(self, path):
-    self._path = path
-    self._bv = load_binary(self._path)
-    self._dwarf = DWARFCore(path)
+  def __init__(self, path_or_bv):
+    if isinstance(path_or_bv, bn.BinaryView):
+      self._bv = path_or_bv
+      self._path = self._bv.file.filename
+    else:
+      self._path = path_or_bv
+      self._bv = load_binary(self._path)
+    self._dwarf = DWARFCore(self._path)
     super(BNProgram, self).__init__(get_arch(self._bv), get_os(self._bv))
 
   def get_function_impl(self, address):
