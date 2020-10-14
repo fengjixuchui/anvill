@@ -18,6 +18,9 @@
 #include "anvill/Analyze.h"
 
 #include <glog/logging.h>
+
+// clang-format off
+#include <remill/BC/Compat/CTypes.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
@@ -30,6 +33,9 @@
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/Type.h>
 #include <llvm/Transforms/Utils/Local.h>
+
+// clang-format on
+
 #include <remill/BC/Compat/ScalarTransforms.h>
 #include <remill/BC/Optimizer.h>
 #include <remill/BC/Util.h>
@@ -865,9 +871,9 @@ void RecoverMemoryAccesses(const Program &program, llvm::Module &module) {
   FindPossibleCrossReferences(program, module, "__anvill_sp", fixups,
                               maybe_fixups, sp_fixups);
 
-  LOG(ERROR) << "fixups.size()=" << fixups.size();
-  LOG(ERROR) << "maybe_fixups.size()=" << maybe_fixups.size();
-  LOG(ERROR) << "sp_fixups.size()=" << sp_fixups.size();
+  LOG(WARNING) << "fixups.size()=" << fixups.size();
+  LOG(WARNING) << "maybe_fixups.size()=" << maybe_fixups.size();
+  LOG(WARNING) << "sp_fixups.size()=" << sp_fixups.size();
   RecoverStackMemoryAccesses(sp_fixups, module);
 
   fixups.clear();

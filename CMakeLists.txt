@@ -18,7 +18,6 @@ cmake_minimum_required(VERSION 3.2)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/settings.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/utils.cmake")
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 
 FindAndSelectClangCompiler()
 
@@ -27,76 +26,19 @@ macro(target_public_headers TARGET)
   set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${ARGN}")
 endmacro()
 
-# warnings and compiler settings
-if(NOT DEFINED WIN32)
-  set(PROJECT_CXXFLAGS
-    ${GLOBAL_CXXFLAGS} -Wconversion -pedantic
-    -Wno-unreachable-code-return
-  )
-endif()
+option(ANVILL_INSTALL_PYTHON2_LIBS "Install Python 2 libraries")
+option(ANVILL_INSTALL_PYTHON3_LIBS "Install Python 3 libraries" ON)
 
 #
 # libraries
 #
 
 # remill
-if(NOT TARGET remill)
-  if("${PLATFORM_NAME}" STREQUAL "windows")
-    set(REMILL_FINDPACKAGE_HINTS HINTS "${CMAKE_INSTALL_PREFIX}/remill/lib")
-  endif()
-
-  find_package(remill REQUIRED ${REMILL_FINDPACKAGE_HINTS})
+if("${PLATFORM_NAME}" STREQUAL "windows")
+  set(REMILL_FINDPACKAGE_HINTS HINTS "${CMAKE_INSTALL_PREFIX}/remill/lib")
 endif()
 
-# llvm
-find_package(LLVM REQUIRED CONFIG HINTS ${FINDPACKAGE_LLVM_HINTS})
-
-string(REPLACE "." ";" LLVM_VERSION_LIST ${LLVM_PACKAGE_VERSION})
-list(GET LLVM_VERSION_LIST 0 LLVM_MAJOR_VERSION)
-list(GET LLVM_VERSION_LIST 1 LLVM_MINOR_VERSION)
-set(REMILL_LLVM_VERSION "${LLVM_MAJOR_VERSION}.${LLVM_MINOR_VERSION}")
-
-set(LLVM_LIBRARIES
-  LLVMCore LLVMAnalysis LLVMSupport LLVMipo LLVMIRReader
-  LLVMBitReader LLVMBitWriter LLVMTransformUtils LLVMScalarOpts
-  LLVMLTO
-)
-list(APPEND PROJECT_LIBRARIES ${LLVM_LIBRARIES})
-list(APPEND PROJECT_DEFINITIONS ${LLVM_DEFINITIONS})
-list(APPEND PROJECT_INCLUDEDIRECTORIES ${LLVM_INCLUDE_DIRS})
-
-# google log module
-find_package(glog REQUIRED)
-list(APPEND PROJECT_LIBRARIES glog::glog)
-
-# gflags
-find_package(gflags REQUIRED)
-list(APPEND PROJECT_LIBRARIES gflags)
-
-# xed
-find_package(XED REQUIRED)
-list(APPEND PROJECT_LIBRARIES ${XED_LIBRARIES})
-list(APPEND PROJECT_INCLUDEDIRECTORIES ${XED_INCLUDE_DIRS})
-
-# z3
-if (LLVM_Z3_INSTALL_DIR)
-  find_package(Z3 4.7.1)
-  set(need_z3 TRUE)
-elseif(DEFINED ENV{TRAILOFBITS_LIBRARIES})
-  set(LLVM_Z3_INSTALL_DIR "$ENV{TRAILOFBITS_LIBRARIES}/z3")
-  set(need_z3 TRUE)
-else()
-  set(need_z3 FALSE)
-endif()
-
-if(need_z3)
-  find_package(Z3 4.7.1)
-  if (NOT Z3_FOUND)
-    message(WARNING "Z3 >= 4.7.1 has not been found in LLVM_Z3_INSTALL_DIR: ${LLVM_Z3_INSTALL_DIR}.")
-  endif()
-  list(APPEND PROJECT_LIBRARIES Z3)
-endif()
-
+find_package(remill REQUIRED ${REMILL_FINDPACKAGE_HINTS})
 
 #
 # target settings
@@ -109,6 +51,7 @@ add_subdirectory(lib/Version)
 add_library(${ANVILL} STATIC
     include/anvill/Type.h
 
+    lib/Arch/AArch64_C.cpp
     lib/Arch/X86_C.cpp
     lib/Arch/X86_FastCall.cpp
     lib/Arch/X86_StdCall.cpp
@@ -135,24 +78,21 @@ add_library(${ANVILL} STATIC
     
     include/anvill/Lift.h
     lib/Lift.cpp
-    
+
+    include/anvill/MCToIRLifter.h
+    lib/MCToIRLifter.cpp
+  
     include/anvill/Optimize.h
     lib/Optimize.cpp
     
     include/anvill/Analyze.h
     lib/Analyze.cpp)
 
-target_compile_definitions(${ANVILL} PUBLIC
-    ${PROJECT_DEFINITIONS})
-
-target_compile_options(${ANVILL} PUBLIC
-    ${PROJECT_CXXFLAGS})
-
 target_include_directories(${ANVILL} PUBLIC
-   "${CMAKE_CURRENT_SOURCE_DIR}/include"
-   ${PROJECT_INCLUDEDIRECTORIES})
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    ${PROJECT_INCLUDEDIRECTORIES})
 
-target_link_libraries(${ANVILL} PUBLIC remill AnvillVersion ${PROJECT_LIBRARIES})
+target_link_libraries(${ANVILL} PUBLIC remill AnvillVersion)
 
 target_public_headers(${ANVILL}
     include/anvill/Analyze.h
@@ -163,8 +103,7 @@ target_public_headers(${ANVILL}
     include/anvill/Type.h
     include/anvill/TypeParser.h
     include/anvill/TypePrinter.h
-    include/anvill/Version.h
-  )
+    include/anvill/Version.h)
 
 #
 # tool target settings
@@ -181,32 +120,57 @@ set(SPECIFY_BITCODE anvill-specify-bitcode-${REMILL_LLVM_VERSION})
 add_executable(${SPECIFY_BITCODE} Bitcode.cpp)
 target_link_libraries(${SPECIFY_BITCODE} PRIVATE ${ANVILL})
 
+set(ANVILL_PYTHON_SOURCES
+    setup.py
+    python/anvill/__init__.py
+    python/anvill/__main__.py
+    python/anvill/arch.py
+    python/anvill/binja.py
+    python/anvill/exc.py
+    python/anvill/function.py
+    python/anvill/ida.py
+    python/anvill/loc.py
+    python/anvill/mem.py
+    python/anvill/os.py
+    python/anvill/program.py
+    python/anvill/type.py
+    python/anvill/var.py)
 
-add_custom_target(install_anvill_python
-  DEPENDS
-  setup.py
-  python/anvill/__init__.py
-  python/anvill/arch.py
-  python/anvill/binja.py
-  python/anvill/dwarf.py
-  python/anvill/exc.py
-  python/anvill/function.py
-  python/anvill/ida.py
-  python/anvill/loc.py
-  python/anvill/mem.py
-  python/anvill/os.py
-  python/anvill/program.py
-  python/anvill/type.py
-  python/anvill/var.py)
+if(NOT DEFINED ENV{VIRTUAL_ENV})
+  # NOT a venv install, specify --user and --prefix
+  set(extra_install_flags "--force --user --prefix=")
+else()
+  #virtual env; install normally
+  set(extra_install_flags "")
+endif()
 
-add_custom_command(
-    TARGET install_anvill_python POST_BUILD
-    COMMAND which python3 && python3 setup.py install --force --user --prefix=
-    COMMENT "Installing Anvill Python 3 API"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+if(ANVILL_INSTALL_PYTHON2_LIBS)
+  add_custom_target(install_anvill_python2
+    DEPENDS ${ANVILL_PYTHON_SOURCES})
+    
+  add_custom_command(
+      TARGET install_anvill_python2 POST_BUILD
+      COMMAND which python2 && python2 setup.py install ${extra_install_flags}
+      COMMENT "Installing Anvill Python 2 API"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
-add_dependencies(${ANVILL}
-  install_anvill_python)
+  add_dependencies(${ANVILL}
+    install_anvill_python2)
+endif()
+
+if(ANVILL_INSTALL_PYTHON3_LIBS)
+  add_custom_target(install_anvill_python3
+    DEPENDS ${ANVILL_PYTHON_SOURCES})
+
+  add_custom_command(
+      TARGET install_anvill_python3 POST_BUILD
+      COMMAND which python3 && python3 setup.py install ${extra_install_flags}
+      COMMENT "Installing Anvill Python 3 API"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
+  add_dependencies(${ANVILL}
+    install_anvill_python3)
+endif()
 
 #
 # install settings
@@ -227,6 +191,19 @@ install(
     TARGETS ${DECOMPILE_JSON}
     RUNTIME DESTINATION "${install_folder}/bin")
 
+set(ROUNDTRIP_TEST
+    scripts/roundtrip.py)
+
+install(
+    FILES ${ROUNDTRIP_TEST}
+    DESTINATION "${install_folder}/share")
+
+FILE(GLOB ROUNDTRIP_TEST_FILES "${PROJECT_SOURCE_DIR}/tests/*.c")
+
+install(
+    FILES ${ROUNDTRIP_TEST_FILES}
+    DESTINATION "${install_folder}/share/tests")
+
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/cmake/anvillConfig.cmake.in"
   "${CMAKE_CURRENT_BINARY_DIR}/anvillConfig.cmake"
@@ -234,4 +211,16 @@ configure_file(
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/anvillConfig.cmake"
     DESTINATION "${install_folder}/lib/cmake/anvill"
+)
+
+#
+# tests
+#
+# Note: the Binary Ninja or IDA Python API must exist to run tests.
+
+enable_testing()
+
+add_test(NAME test_roundtrip
+  COMMAND ${PROJECT_SOURCE_DIR}/scripts/roundtrip.py $<TARGET_FILE:${DECOMPILE_JSON}> ${PROJECT_SOURCE_DIR}/tests ${CMAKE_C_COMPILER}
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
 )

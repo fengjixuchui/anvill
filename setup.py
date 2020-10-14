@@ -28,9 +28,9 @@ setuptools.setup(
     author_email="peter@trailofbits.com",
     url="https://github.com/lifting-bits/anvill",
     license="AGPL 3",
+    install_requires=["pyelftools"],
     py_modules=[
-        "anvill.__init__", "anvill.arch", "anvill.binja",
-        "anvill.dwarf", "anvill.dwarf_type", "anvill.exc",
-        "anvill.function", "anvill.ida", "anvill.loc",
+        "anvill.__init__", "anvill.__main__", "anvill.arch", "anvill.binja",
+        "anvill.exc", "anvill.function", "anvill.ida", "anvill.loc",
         "anvill.mem", "anvill.os", "anvill.program", "anvill.type",
         "anvill.var"])
