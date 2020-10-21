@@ -28,16 +28,11 @@
 #include "anvill/Decl.h"
 #include "anvill/MCToIRLifter.h"
 #include "anvill/Program.h"
+#include "anvill/Util.h"
 
 namespace anvill {
 
 namespace {
-
-static std::string CreateFunctionName(uint64_t addr) {
-  std::stringstream ss;
-  ss << "sub_" << std::hex << addr;
-  return ss.str();
-}
 
 // Adapt `src` to another type (likely an integer type) that is `dest_type`.
 static llvm::Value *AdaptToType(llvm::IRBuilder<> &ir, llvm::Value *src,
@@ -102,7 +97,7 @@ static llvm::Value *AdaptToType(llvm::IRBuilder<> &ir, llvm::Value *src,
         return ir.CreateBitCast(src, dest_ptr_type);
       }
 
-    // Convert the pointer to an integer.
+      // Convert the pointer to an integer.
     } else if (auto dest_int_type =
                    llvm::dyn_cast<llvm::IntegerType>(dest_type);
                dest_int_type) {
@@ -145,18 +140,6 @@ static llvm::Value *AdaptToType(llvm::IRBuilder<> &ir, llvm::Value *src,
   return nullptr;
 }
 
-// Clear out LLVM variable names. They're usually not helpful.
-static void ClearVariableNames(llvm::Function *func) {
-  for (auto &block : *func) {
-    block.setName("");
-    for (auto &inst : block) {
-      if (inst.hasName()) {
-        inst.setName("");
-      }
-    }
-  }
-}
-
 // A function that ensures that the memory pointer escapes, and thus none of
 // the memory writes at the end of a function are lost.
 static llvm::Function *
@@ -178,61 +161,12 @@ GetMemoryEscapeFunc(const remill::IntrinsicTable &intrinsics) {
                                 module);
 }
 
-// Create an adaptor function that converts lifted state to native state.
-// This function is marked as always-inline so that when a lifted function
-// calls this function, it ends up doing so in a way that, post-optimization,
-// ends up calling the higher-level function.
-static llvm::Function *
-CreateLiftedToABIAdaptor(const std::string &name,
-                         const remill::IntrinsicTable &intrinsics,
-                         const anvill::FunctionDecl *decl) {
-
-  std::stringstream ss;
-  ss << name << ".anvill.lifted_to_native";
-  auto lifted_name = ss.str();
-  auto module = intrinsics.error->getParent();
-  auto adaptor = remill::DeclareLiftedFunction(module, lifted_name);
-
-  if (!adaptor->isDeclaration()) {
-    return adaptor;  // Already defined.
-  }
-
-  // Declare all registers in that function. Makes life easier.
-  remill::CloneBlockFunctionInto(adaptor);
-
-  auto block = &(adaptor->getEntryBlock());
-  auto state_ptr = remill::LoadStatePointer(block);
-  auto mem_ptr = remill::LoadMemoryPointer(block);
-  auto new_mem_ptr =
-      decl->CallFromLiftedBlock(name, intrinsics, block, state_ptr, mem_ptr);
-
-  llvm::IRBuilder<> ir(block);
-  ir.CreateRet(new_mem_ptr);
-
-  adaptor->removeFnAttr(llvm::Attribute::NoInline);
-  adaptor->addFnAttr(llvm::Attribute::InlineHint);
-  adaptor->addFnAttr(llvm::Attribute::AlwaysInline);
-  adaptor->setLinkage(llvm::GlobalValue::PrivateLinkage);
-
-  return adaptor;
-}
-
-static void ReplaceLiftedCalls(const FunctionDecl *decl,
-                               llvm::Function *lifted_func) {
-
-  // Create adaptor function
-  remill::IntrinsicTable intrinsics(lifted_func->getParent());
-  auto name = CreateFunctionName(decl->address);
-  auto adaptor = CreateLiftedToABIAdaptor(name, intrinsics, decl);
-
-  // Replace calls
-  for (auto call : remill::CallersOf(lifted_func)) {
-    call->setCalledFunction(adaptor);
-  }
-}
-
-static void DefineABIFunction(const FunctionDecl *decl,
-                              llvm::Function *lifted_func) {
+// Define the function that marshals native state to lifted state.
+static void DefineNativeToLiftedWrapper(const remill::Arch *arch,
+                                        const FunctionDecl &decl,
+                                        const FunctionEntry &entry) {
+  const auto native_func = entry.native_to_lifted;
+  const auto lifted_func = entry.lifted;
 
   // Set inlining attributes for lifted function
   lifted_func->removeFnAttr(llvm::Attribute::NoInline);
@@ -243,17 +177,19 @@ static void DefineABIFunction(const FunctionDecl *decl,
   auto module = lifted_func->getParent();
   auto &ctx = module->getContext();
 
-  // Declare ABI-level function
-  auto func = decl->DeclareInModule(CreateFunctionName(decl->address), *module);
+  // Declare native function
+  CHECK(native_func->isDeclaration());
+  native_func->removeFnAttr(llvm::Attribute::InlineHint);
+  native_func->removeFnAttr(llvm::Attribute::AlwaysInline);
+  native_func->addFnAttr(llvm::Attribute::NoInline);
 
-  // Get arch from the ABI-level function
-  auto arch = decl->arch;
+  // Get arch from the native function
   CHECK_EQ(arch->context, &ctx);
 
-  // Create a state structure and a stack frame in the ABI-level function
+  // Create a state structure and a stack frame in the native function
   // and we'll call the lifted function with that. The lifted function
   // will get inlined into this function.
-  auto block = llvm::BasicBlock::Create(ctx, "", func);
+  auto block = llvm::BasicBlock::Create(ctx, "", native_func);
   llvm::IRBuilder<> ir(block);
 
   // Create a memory pointer.
@@ -265,25 +201,25 @@ static void DefineABIFunction(const FunctionDecl *decl,
   auto state_type = state_ptr_type->getElementType();
   auto state_ptr = ir.CreateAlloca(state_type);
 
-  // Get or create globals for all top-level registers. The idea here is that
-  // the spec could feasibly miss some dependencies, and so after optimization,
-  // we'll be able to observe uses of `__anvill_reg_*` globals, and handle
-  // them appropriately.
-  arch->ForEachRegister([=, &ir](const remill::Register *reg_) {
-    if (auto reg = reg_->EnclosingRegister(); reg_ == reg) {
-      std::stringstream ss;
-      ss << "__anvill_reg_" << reg->name;
-      const auto reg_name = ss.str();
-      auto reg_global = module->getGlobalVariable(reg_name);
-      if (!reg_global) {
-        reg_global = new llvm::GlobalVariable(
-            *module, reg->type, false, llvm::GlobalValue::ExternalLinkage,
-            nullptr, reg_name);
-      }
-      auto reg_ptr = reg->AddressOf(state_ptr, block);
-      ir.CreateStore(ir.CreateLoad(reg_global), reg_ptr);
-    }
-  });
+  //  // Get or create globals for all top-level registers. The idea here is that
+  //  // the spec could feasibly miss some dependencies, and so after optimization,
+  //  // we'll be able to observe uses of `__anvill_reg_*` globals, and handle
+  //  // them appropriately.
+  //  arch->ForEachRegister([=, &ir](const remill::Register *reg_) {
+  //    if (auto reg = reg_->EnclosingRegister(); reg_ == reg) {
+  //      std::stringstream ss;
+  //      ss << "__anvill_reg_" << reg->name;
+  //      const auto reg_name = ss.str();
+  //      auto reg_global = module->getGlobalVariable(reg_name);
+  //      if (!reg_global) {
+  //        reg_global = new llvm::GlobalVariable(
+  //            *module, reg->type, false, llvm::GlobalValue::ExternalLinkage,
+  //            nullptr, reg_name);
+  //      }
+  //      auto reg_ptr = reg->AddressOf(state_ptr, block);
+  //      ir.CreateStore(ir.CreateLoad(reg_global), reg_ptr);
+  //    }
+  //  });
 
   // Store the program counter into the state.
   auto pc_reg = arch->RegisterByName(arch->ProgramCounterRegisterName());
@@ -298,7 +234,7 @@ static void DefineABIFunction(const FunctionDecl *decl,
 
   auto pc = llvm::ConstantExpr::getAdd(
       llvm::ConstantExpr::getPtrToInt(base_pc, pc_reg->type),
-      llvm::ConstantInt::get(pc_reg->type, decl->address, false));
+      llvm::ConstantInt::get(pc_reg->type, decl.address, false));
   ir.SetInsertPoint(block);
   ir.CreateStore(pc, pc_reg_ptr);
 
@@ -328,14 +264,14 @@ static void DefineABIFunction(const FunctionDecl *decl,
   auto ret_addr = llvm::ConstantExpr::getPtrToInt(base_ra, pc_reg->type);
 
   remill::IntrinsicTable intrinsics(module);
-  mem_ptr = StoreNativeValue(ret_addr, decl->return_address, intrinsics, block,
+  mem_ptr = StoreNativeValue(ret_addr, decl.return_address, intrinsics, block,
                              state_ptr, mem_ptr);
 
   // Store the function parameters either into the state struct
   // or into memory (likely the stack).
   auto arg_index = 0u;
-  for (auto &arg : func->args()) {
-    const auto &param_decl = decl->params[arg_index++];
+  for (auto &arg : native_func->args()) {
+    const auto &param_decl = decl.params[arg_index++];
     mem_ptr = StoreNativeValue(&arg, param_decl, intrinsics, block, state_ptr,
                                mem_ptr);
   }
@@ -349,15 +285,15 @@ static void DefineABIFunction(const FunctionDecl *decl,
 
   llvm::Value *ret_val = nullptr;
 
-  if (decl->returns.size() == 1) {
-    ret_val = LoadLiftedValue(decl->returns.front(), intrinsics, block,
+  if (decl.returns.size() == 1) {
+    ret_val = LoadLiftedValue(decl.returns.front(), intrinsics, block,
                               state_ptr, mem_ptr);
     ir.SetInsertPoint(block);
 
-  } else if (1 < decl->returns.size()) {
-    ret_val = llvm::UndefValue::get(func->getReturnType());
+  } else if (1 < decl.returns.size()) {
+    ret_val = llvm::UndefValue::get(native_func->getReturnType());
     auto index = 0u;
-    for (auto &ret_decl : decl->returns) {
+    for (auto &ret_decl : decl.returns) {
       auto partial_ret_val =
           LoadLiftedValue(ret_decl, intrinsics, block, state_ptr, mem_ptr);
       ir.SetInsertPoint(block);
@@ -376,26 +312,86 @@ static void DefineABIFunction(const FunctionDecl *decl,
   } else {
     ir.CreateRetVoid();
   }
+}
 
-  llvm::InlineFunctionInfo info;
-  llvm::InlineFunction(call_to_lifted_func, info);
+// Define a function that marshals lifted state to native state.
+static void DefineLiftedToNativeWrapper(const FunctionDecl &decl,
+                                        const FunctionEntry &entry) {
+  const auto lifted_func = entry.lifted_to_native;
+  CHECK(lifted_func->isDeclaration());
 
-  std::vector<llvm::CallInst *> calls_to_inline;
+  remill::IntrinsicTable intrinsics(lifted_func->getParent());
+
+  remill::CloneBlockFunctionInto(lifted_func);
+  lifted_func->removeFnAttr(llvm::Attribute::NoInline);
+  lifted_func->addFnAttr(llvm::Attribute::InlineHint);
+  lifted_func->addFnAttr(llvm::Attribute::AlwaysInline);
+  lifted_func->setLinkage(llvm::GlobalValue::InternalLinkage);
+
+  auto mem_ptr = remill::NthArgument(lifted_func, remill::kMemoryPointerArgNum);
+  auto state_ptr =
+      remill::NthArgument(lifted_func, remill::kStatePointerArgNum);
+  auto block = &(lifted_func->getEntryBlock());
+
+  llvm::IRBuilder<> ir(block);
+  auto new_mem_ptr =
+      decl.CallFromLiftedBlock(CreateFunctionName(decl.address), intrinsics,
+                               block, state_ptr, mem_ptr, true);
+
+  ir.CreateRet(new_mem_ptr);
+}
+
+// Clear out LLVM variable names. They're usually not helpful.
+static void ClearVariableNames(llvm::Function *func) {
   for (auto &block : *func) {
+    block.setName("");
     for (auto &inst : block) {
-      if (auto call_inst = llvm::dyn_cast<llvm::CallInst>(&inst)) {
-        calls_to_inline.push_back(call_inst);
+      if (inst.hasName()) {
+        inst.setName("");
       }
     }
   }
+}
 
-  for (auto call_inst : calls_to_inline) {
-    llvm::InlineFunctionInfo info;
-    llvm::InlineFunction(call_inst, info);
+// Optimize a function.
+static void OptimizeFunction(llvm::Function *func) {
+  std::vector<llvm::CallInst *> calls_to_inline;
+  for (auto changed = true; changed; changed = !calls_to_inline.empty()) {
+    calls_to_inline.clear();
+
+    for (auto &block : *func) {
+      for (auto &inst : block) {
+        if (auto call_inst = llvm::dyn_cast<llvm::CallInst>(&inst); call_inst) {
+          if (auto called_func = call_inst->getCalledFunction();
+              called_func && !called_func->isDeclaration() &&
+              !called_func->hasFnAttribute(llvm::Attribute::NoInline)) {
+            calls_to_inline.push_back(call_inst);
+          }
+        }
+      }
+    }
+
+    for (auto call_inst : calls_to_inline) {
+      llvm::InlineFunctionInfo info;
+      llvm::InlineFunction(call_inst, info);
+    }
   }
+
+  // Initialize cleanup optimizations
+  llvm::legacy::FunctionPassManager fpm(func->getParent());
+  fpm.add(llvm::createCFGSimplificationPass());
+  fpm.add(llvm::createPromoteMemoryToRegisterPass());
+  fpm.add(llvm::createReassociatePass());
+  fpm.add(llvm::createDeadStoreEliminationPass());
+  fpm.add(llvm::createDeadCodeEliminationPass());
+  fpm.add(llvm::createSROAPass());
+  fpm.doInitialization();
+  fpm.run(*func);
+  fpm.doFinalization();
 
   ClearVariableNames(func);
 }
+
 }  // namespace
 
 // Produce one or more instructions in `in_block` to store the
@@ -432,7 +428,7 @@ llvm::Value *StoreNativeValue(llvm::Value *native_val, const ValueDecl &decl,
 
     return mem_ptr;
 
-  // Store it to memory.
+    // Store it to memory.
   } else if (decl.mem_reg) {
     auto ptr_to_reg = decl.mem_reg->AddressOf(state_ptr, in_block);
 
@@ -471,7 +467,7 @@ llvm::Value *LoadLiftedValue(const ValueDecl &decl,
           ir.CreateBitCast(ptr_to_reg, llvm::PointerType::get(decl.type, 0)));
     }
 
-  // Load it out of memory.
+    // Load it out of memory.
   } else if (decl.mem_reg) {
     auto ptr_to_reg = decl.mem_reg->AddressOf(state_ptr, in_block);
     llvm::IRBuilder<> ir(in_block);
@@ -491,58 +487,27 @@ bool LiftCodeIntoModule(const remill::Arch *arch, const Program &program,
                         llvm::Module &module) {
   DLOG(INFO) << "LiftCodeIntoModule";
 
-  // Initialize cleanup optimizations
-  llvm::legacy::FunctionPassManager fpm(&module);
-  fpm.add(llvm::createCFGSimplificationPass());
-  fpm.add(llvm::createPromoteMemoryToRegisterPass());
-  fpm.add(llvm::createReassociatePass());
-  fpm.add(llvm::createDeadStoreEliminationPass());
-  fpm.add(llvm::createDeadCodeEliminationPass());
-  fpm.doInitialization();
-
   // Create our lifter
   MCToIRLifter lifter(arch, program, module);
 
-  // Declare global variables
+  // Declare global variables.
   program.ForEachVariable([&](const anvill::GlobalVarDecl *decl) {
-    std::stringstream ss;
-    ss << "data_" << std::hex << decl->address << std::dec;
-    decl->DeclareInModule(ss.str(), module);
+    decl->DeclareInModule(anvill::CreateVariableName(decl->address), module);
     return true;
   });
 
-  // Forward declare lifted functions
+  // Lift functions.
   program.ForEachFunction([&](const FunctionDecl *decl) {
-    lifter.GetOrDeclareFunction(decl->address);
-    return true;
-  });
-
-  // Lift functions
-  program.ForEachFunction([&](const FunctionDecl *decl) {
-    lifter.GetOrDefineFunction(decl->address);
-    return true;
-  });
-
-  // Replace calls to lifted functions with calls to ABI-level functions
-  program.ForEachFunction([&](const FunctionDecl *decl) {
-    auto func = lifter.GetOrDeclareFunction(decl->address);
-    ReplaceLiftedCalls(decl, func);
-    return true;
-  });
-
-  // Define ABI-level functions
-  program.ForEachFunction([&](const FunctionDecl *decl) {
-    auto func = lifter.GetOrDeclareFunction(decl->address);
-    fpm.run(*func);
-    DefineABIFunction(decl, func);
+    const auto entry = lifter.LiftFunction(*decl);
+    DefineNativeToLiftedWrapper(arch, *decl, entry);
+    DefineLiftedToNativeWrapper(*decl, entry);
+    OptimizeFunction(entry.native_to_lifted);
     return true;
   });
 
   // Verify the module
   CHECK(remill::VerifyModule(&module));
 
-  // Done
-  fpm.doFinalization();
   return true;
 }
 

@@ -21,14 +21,20 @@
 #include <remill/BC/IntrinsicTable.h>
 #include <remill/BC/Lifter.h>
 
+#include <llvm/IR/IRBuilder.h>
+
 #include <unordered_map>
 
 namespace llvm {
+class BasicBlock;
 class Module;
+class Type;
+class Value;
 }  // namespace llvm
 
 namespace remill {
 class Arch;
+class IntrinsicTable;
 }  // namespace remill
 
 namespace anvill {
